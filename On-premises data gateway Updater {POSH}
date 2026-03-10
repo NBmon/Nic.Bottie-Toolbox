@@ -1,0 +1,671 @@
+#Requires -Version 7.0
+<#
+.SYNOPSIS
+    Programmatically updates all on-premises data gateway clusters across
+    a tenant using Update-DataGatewayClusterMember, with Azure Key Vault
+    integration and baseline version validation.
+
+.DESCRIPTION
+    This script:
+      1. Retrieves service principal credentials from Azure Key Vault.
+      2. Authenticates to the Data Gateway service via the service principal.
+      3. Discovers all gateway clusters in the tenant (Organization scope).
+      4. VALIDATES that every gateway meets the November 2025 baseline
+         version (3000.294). Halts execution if any gateway is too old.
+      5. For multi-member clusters, performs a rolling update: disable,
+         drain, update, re-enable, next member.
+      6. For single-member clusters, updates directly.
+      7. Polls -CheckStatus after each update to confirm completion.
+      8. Outputs a summary report of all actions taken.
+
+.NOTES
+    ======================================================================
+    AZURE KEY VAULT SETUP (one-time, manual steps in the Azure Portal)
+    ======================================================================
+
+    Before running this script, you must create an Azure Key Vault and
+    store three secrets in it. Follow these steps:
+
+    STEP 1 — Create the Key Vault
+      1. Sign in to the Azure Portal (portal.azure.com).
+      2. Search for "Key vaults" in the top search bar and select it.
+      3. Click "+ Create".
+      4. Choose your Subscription and Resource Group (or create one).
+      5. Enter a globally unique Key Vault name
+         (e.g., "kv-gateway-automation").
+      6. Select a Region close to your gateway infrastructure.
+      7. Leave the pricing tier as "Standard".
+      8. Click "Review + create", then "Create".
+
+    STEP 2 — Store Your Secrets
+      1. Open your new Key Vault in the portal.
+      2. In the left menu, go to "Objects" > "Secrets".
+      3. Click "+ Generate/Import" and create three secrets:
+
+         Secret Name              | Value
+         -------------------------|--------------------------------------
+         GatewaySpAppId           | Your App Registration's Application
+                                  | (Client) ID  (a GUID)
+         GatewaySpSecret          | Your App Registration's Client Secret
+                                  | value (the string you copied at
+                                  | creation time)
+         GatewaySpTenantId        | Your Entra ID Tenant (Directory) ID
+                                  | (a GUID)
+
+      4. For each secret, click "Create" after entering the name and value.
+
+    STEP 3 — Grant the Service Principal Access to Read Secrets
+      The same service principal that will run this script needs
+      permission to read its own credentials from Key Vault.
+
+      Option A — Azure RBAC (recommended):
+        1. In the Key Vault, go to "Access control (IAM)".
+        2. Click "+ Add" > "Add role assignment".
+        3. Select the role "Key Vault Secrets User".
+        4. Under "Members", search for your App Registration name
+           and select it.
+        5. Click "Review + assign".
+
+      Option B — Vault Access Policy (legacy):
+        1. In the Key Vault, go to "Access policies".
+        2. Click "+ Add Access Policy".
+        3. Under "Secret permissions", check "Get" and "List".
+        4. Under "Select principal", find your App Registration.
+        5. Click "Add", then "Save".
+
+    STEP 4 — (If running from Azure Automation / Fabric)
+      If you use a Managed Identity instead of a service principal,
+      grant the Managed Identity the same "Key Vault Secrets User"
+      role from Step 3, and use Connect-AzAccount -Identity in the
+      script instead of the explicit credential login shown below.
+
+    ======================================================================
+    RUNNING THIS SCRIPT INSIDE MICROSOFT FABRIC
+    ======================================================================
+
+    Fabric notebooks run on Apache Spark (PySpark/Scala/R) and do NOT
+    natively support PowerShell 7 modules like DataGateway. You have
+    three viable options for executing this from within the Fabric
+    ecosystem:
+
+    OPTION A — Fabric Data Pipeline + Azure Automation Runbook
+      (Recommended for production)
+
+      This is the cleanest and most scalable approach. The idea is to
+      host this PowerShell script as an Azure Automation Runbook and
+      trigger it from a Fabric Data Factory Pipeline using a Web
+      Activity or Webhook Activity.
+
+      1. Create an Azure Automation Account in the Azure Portal.
+      2. Under "Runbooks", click "+ Create a runbook".
+         - Name: "Update-TenantGateways"
+         - Runbook type: "PowerShell"
+         - Runtime version: 7.2
+      3. Paste this script into the runbook editor.
+      4. Under "Modules" in your Automation Account, import:
+         - Az.Accounts
+         - Az.KeyVault
+         - DataGateway (upload the .nupkg from PowerShell Gallery)
+      5. Publish the runbook.
+      6. Create a Webhook on the runbook (Runbook > Webhooks > Add).
+         Copy the webhook URL (shown only once).
+      7. In Fabric Data Factory, create a Pipeline and add a
+         "Web Activity":
+         - URL: your webhook URL
+         - Method: POST
+         - Body: {} (empty JSON)
+      8. Schedule the pipeline to run monthly, or trigger it manually.
+
+      The runbook executes in Azure with full PowerShell 7 support,
+      the DataGateway module, and access to Key Vault via Managed
+      Identity or service principal. The Fabric pipeline simply
+      orchestrates when it runs.
+
+    OPTION B — Fabric Notebook (PySpark) Calling REST APIs Directly
+      (Alternative if you want everything inside Fabric)
+
+      Instead of using the DataGateway PowerShell module, rewrite the
+      gateway management logic as direct REST API calls from a Python
+      notebook. This avoids the PowerShell dependency entirely:
+
+        import requests, msal
+
+        # Get token via MSAL
+        app = msal.ConfidentialClientApplication(
+            client_id=app_id,
+            client_credential=client_secret,
+            authority=f"https://login.microsoftonline.com/{tenant_id}"
+        )
+        token = app.acquire_token_for_client(
+            scopes=["https://analysis.windows.net/powerbi/api/.default"]
+        )
+
+        # Call gateway APIs
+        headers = {"Authorization": f"Bearer {token['access_token']}"}
+        gateways = requests.get(
+            "https://api.powerbi.com/v1.0/myorg/gateways",
+            headers=headers
+        ).json()
+
+      However, the Update-DataGatewayClusterMember functionality
+      may not yet have a REST API equivalent (it is a PowerShell-only
+      preview feature). In that case, Option A remains the best path.
+
+    OPTION C — Fabric Notebook Shelling Out to PowerShell
+      (Quick and dirty — not recommended for production)
+
+      Fabric Spark nodes have a Linux OS. You can shell out to
+      pwsh (PowerShell Core) if it is available in the runtime:
+
+        import subprocess
+        result = subprocess.run(
+            ["pwsh", "-File", "/path/to/script.ps1"],
+            capture_output=True, text=True
+        )
+
+      This is fragile because the Fabric Spark runtime does not
+      guarantee pwsh availability or the ability to install the
+      DataGateway module. Use Option A instead.
+
+    ======================================================================
+
+.PARAMETER KeyVaultName
+    The name of the Azure Key Vault containing the service principal
+    credentials (e.g., "kv-gateway-automation").
+
+.PARAMETER AppIdSecretName
+    The name of the Key Vault secret holding the Application (Client) ID.
+    Default: "GatewaySpAppId"
+
+.PARAMETER ClientSecretName
+    The name of the Key Vault secret holding the Client Secret value.
+    Default: "GatewaySpSecret"
+
+.PARAMETER TenantIdSecretName
+    The name of the Key Vault secret holding the Tenant (Directory) ID.
+    Default: "GatewaySpTenantId"
+
+.PARAMETER DrainWaitMinutes
+    Minutes to wait for in-flight queries to drain after disabling a
+    gateway member. Default is 30.
+
+.PARAMETER PollIntervalSeconds
+    Seconds between status polls when checking update progress.
+    Default is 60.
+
+.PARAMETER MaxPollAttempts
+    Maximum number of polling attempts before timing out.
+    Default is 30 (i.e., 30 minutes at 60-second intervals).
+
+.PARAMETER WhatIf
+    If specified, the script discovers, validates, and reports on all
+    gateways but does NOT trigger any updates. Use this for a dry run.
+
+.EXAMPLE
+    .\Update-AllTenantGateways.ps1 -KeyVaultName "kv-gateway-automation"
+
+.EXAMPLE
+    # Dry run — discover, validate versions, report only
+    .\Update-AllTenantGateways.ps1 -KeyVaultName "kv-gateway-automation" -WhatIf
+
+.EXAMPLE
+    # Custom drain time for long-running refresh environments
+    .\Update-AllTenantGateways.ps1 `
+        -KeyVaultName "kv-gateway-automation" `
+        -DrainWaitMinutes 60 `
+        -PollIntervalSeconds 90
+#>
+
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    [Parameter(Mandatory)]
+    [string]$KeyVaultName,
+
+    [string]$AppIdSecretName     = "GatewaySpAppId",
+    [string]$ClientSecretName    = "GatewaySpSecret",
+    [string]$TenantIdSecretName  = "GatewaySpTenantId",
+
+    [int]$DrainWaitMinutes       = 30,
+    [int]$PollIntervalSeconds    = 60,
+    [int]$MaxPollAttempts        = 30
+)
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+# The November 2025 release is the baseline version required
+# for Update-DataGatewayClusterMember to function.
+# Version 3000.294 = November 2025 release.
+$BASELINE_VERSION = [version]"3000.294.0"
+$BASELINE_LABEL   = "November 2025 (3000.294)"
+
+# ============================================================
+# SECTION 1: Module Check and Installation
+# ============================================================
+
+$requiredModules = @("Az.Accounts", "Az.KeyVault", "DataGateway")
+
+foreach ($mod in $requiredModules) {
+    if (-not (Get-Module -ListAvailable -Name $mod)) {
+        Write-Host "[SETUP] Module '$mod' not found. Installing..." -ForegroundColor Yellow
+        Install-Module -Name $mod -Scope CurrentUser -Force -AllowClobber
+    }
+}
+Import-Module Az.Accounts -Force
+Import-Module Az.KeyVault -Force
+Import-Module DataGateway  -Force
+
+Write-Host "[SETUP] All required modules loaded." -ForegroundColor Green
+
+# ============================================================
+# SECTION 2: Retrieve Credentials from Azure Key Vault
+# ============================================================
+
+Write-Host "`n[KEYVAULT] Authenticating to Azure..." -ForegroundColor Cyan
+
+# If running in Azure Automation with a Managed Identity, use:
+#   Connect-AzAccount -Identity
+# If running locally or in CI/CD with existing Az context, the
+# existing session may already be authenticated.
+try {
+    $azContext = Get-AzContext
+    if (-not $azContext) {
+        # Interactive login fallback — for local dev/testing.
+        # In Azure Automation, replace with: Connect-AzAccount -Identity
+        Connect-AzAccount
+    }
+    Write-Host "[KEYVAULT] Azure session active as: $($azContext.Account.Id ?? 'Managed Identity')" -ForegroundColor Green
+}
+catch {
+    Write-Error "[KEYVAULT] Failed to authenticate to Azure: $_"
+    exit 1
+}
+
+Write-Host "[KEYVAULT] Retrieving secrets from vault '$KeyVaultName'..." -ForegroundColor Cyan
+
+try {
+    $ApplicationId = Get-AzKeyVaultSecret `
+        -VaultName $KeyVaultName `
+        -Name $AppIdSecretName `
+        -AsPlainText
+
+    $ClientSecret = Get-AzKeyVaultSecret `
+        -VaultName $KeyVaultName `
+        -Name $ClientSecretName `
+        -AsPlainText
+
+    $TenantId = Get-AzKeyVaultSecret `
+        -VaultName $KeyVaultName `
+        -Name $TenantIdSecretName `
+        -AsPlainText
+
+    # Validate that none came back empty
+    if ([string]::IsNullOrWhiteSpace($ApplicationId) -or
+        [string]::IsNullOrWhiteSpace($ClientSecret) -or
+        [string]::IsNullOrWhiteSpace($TenantId)) {
+        throw "One or more Key Vault secrets returned empty values."
+    }
+
+    Write-Host "[KEYVAULT] All three secrets retrieved successfully." -ForegroundColor Green
+}
+catch {
+    Write-Error "[KEYVAULT] Failed to retrieve secrets: $_"
+    Write-Error "Ensure the Key Vault '$KeyVaultName' exists, the secret names are correct, and the running identity has 'Key Vault Secrets User' permissions."
+    exit 1
+}
+
+# ============================================================
+# SECTION 3: Authenticate to Data Gateway Service
+# ============================================================
+
+Write-Host "`n[AUTH] Connecting to Data Gateway service..." -ForegroundColor Cyan
+
+$secureSecret = $ClientSecret | ConvertTo-SecureString -AsPlainText -Force
+
+try {
+    Connect-DataGatewayServiceAccount `
+        -ApplicationId $ApplicationId `
+        -ClientSecret $secureSecret `
+        -Tenant $TenantId
+    Write-Host "[AUTH] Successfully authenticated to Data Gateway service." -ForegroundColor Green
+}
+catch {
+    Write-Error "[AUTH] Failed to authenticate: $_"
+    exit 1
+}
+
+# Clear the plain-text secret from memory as a security precaution
+$ClientSecret = $null
+[System.GC]::Collect()
+
+# ============================================================
+# SECTION 4: Discover All Gateway Clusters (Tenant-Wide)
+# ============================================================
+
+Write-Host "`n[DISCOVERY] Retrieving all gateway clusters in the tenant..." -ForegroundColor Cyan
+
+try {
+    $allClusters = Get-DataGatewayCluster -Scope Organization
+}
+catch {
+    Write-Error "[DISCOVERY] Failed to retrieve clusters: $_"
+    exit 1
+}
+
+if (-not $allClusters -or $allClusters.Count -eq 0) {
+    Write-Host "[DISCOVERY] No gateway clusters found in this tenant." -ForegroundColor Yellow
+    exit 0
+}
+
+Write-Host "[DISCOVERY] Found $($allClusters.Count) gateway cluster(s).`n" -ForegroundColor Green
+
+# ============================================================
+# SECTION 5: Build Inventory and Validate Baseline Version
+# ============================================================
+
+$inventory       = @()
+$belowBaseline   = @()
+
+foreach ($cluster in $allClusters) {
+    $clusterId   = $cluster.Id
+    $clusterName = $cluster.Name
+
+    try {
+        $status = Get-DataGatewayClusterStatus `
+            -GatewayClusterId $clusterId `
+            -Scope Organization
+
+        $versionStr = $status.GatewayVersion
+        $parsedVersion = $null
+
+        # Parse the version string. Gateway versions look like
+        # "3000.294.5" or "3000.298.0". We need at least 3000.294.x
+        if ($versionStr -and $versionStr -match '^\d+\.\d+') {
+            try { $parsedVersion = [version]$versionStr } catch { }
+        }
+
+        $meetsBaseline = $false
+        if ($parsedVersion) {
+            # Compare Major.Minor (e.g., 3000.294 >= 3000.294)
+            $meetsBaseline = ($parsedVersion -ge $BASELINE_VERSION)
+        }
+
+        $entry = [PSCustomObject]@{
+            ClusterName    = $clusterName
+            ClusterId      = $clusterId
+            ClusterStatus  = $status.ClusterStatus
+            GatewayVersion = $versionStr ?? "Unknown"
+            MeetsBaseline  = $meetsBaseline
+            UpgradeState   = $status.GatewayUpgradeState
+            MemberCount    = if ($cluster.MemberGateways) {
+                                 $cluster.MemberGateways.Count
+                             } else { 1 }
+        }
+
+        $inventory += $entry
+
+        if (-not $meetsBaseline) {
+            $belowBaseline += $entry
+        }
+    }
+    catch {
+        Write-Warning "[INVENTORY] Could not get status for '$clusterName' ($clusterId): $_"
+        $entry = [PSCustomObject]@{
+            ClusterName    = $clusterName
+            ClusterId      = $clusterId
+            ClusterStatus  = "Unknown"
+            GatewayVersion = "Unknown"
+            MeetsBaseline  = $false
+            UpgradeState   = "Unknown"
+            MemberCount    = 0
+        }
+        $inventory    += $entry
+        $belowBaseline += $entry
+    }
+}
+
+# Display the inventory
+Write-Host "==================== GATEWAY INVENTORY ====================" -ForegroundColor Cyan
+$inventory | Format-Table ClusterName, GatewayVersion, MeetsBaseline, ClusterStatus, MemberCount -AutoSize
+Write-Host "==========================================================`n" -ForegroundColor Cyan
+
+# ============================================================
+# SECTION 6: Baseline Version Gate — Halt If Any Below Minimum
+# ============================================================
+
+if ($belowBaseline.Count -gt 0) {
+    Write-Host "!!! BASELINE VERSION CHECK FAILED !!!" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "The following gateway cluster(s) are running a version BELOW" -ForegroundColor Red
+    Write-Host "the required $BASELINE_LABEL baseline:" -ForegroundColor Red
+    Write-Host ""
+
+    $belowBaseline | Format-Table ClusterName, GatewayVersion, ClusterId -AutoSize
+
+    Write-Host "Update-DataGatewayClusterMember requires all gateways to" -ForegroundColor Red
+    Write-Host "be at version $BASELINE_VERSION or later." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "REMEDIATION:" -ForegroundColor Yellow
+    Write-Host "  For each gateway below baseline, log into the gateway" -ForegroundColor Yellow
+    Write-Host "  machine and run:" -ForegroundColor Yellow
+    Write-Host "    Install-DataGateway -AcceptConditions" -ForegroundColor White
+    Write-Host "  This will upgrade the gateway to the latest version." -ForegroundColor Yellow
+    Write-Host "  Alternatively, download the latest installer from:" -ForegroundColor Yellow
+    Write-Host "    https://go.microsoft.com/fwlink/?LinkId=2116849" -ForegroundColor White
+    Write-Host ""
+
+    # Throw a terminating error so that any calling orchestrator
+    # (Azure Automation, Fabric Pipeline, etc.) sees a failure.
+    throw "HALTED: $($belowBaseline.Count) gateway(s) below baseline version $BASELINE_VERSION. See output above for details."
+}
+
+Write-Host "[VALIDATE] All gateways meet the $BASELINE_LABEL baseline. Proceeding.`n" -ForegroundColor Green
+
+# ============================================================
+# SECTION 7: If -WhatIf, stop here after validation
+# ============================================================
+
+if ($WhatIfPreference) {
+    Write-Host "[DRY RUN] -WhatIf specified. No updates will be performed." -ForegroundColor Yellow
+    Write-Host "[DRY RUN] All gateways passed the baseline check."
+    Write-Host "[DRY RUN] Remove -WhatIf to execute updates."
+    exit 0
+}
+
+# ============================================================
+# SECTION 8: Helper Functions
+# ============================================================
+
+function Wait-ForUpdateCompletion {
+    param(
+        [Parameter(Mandatory)][string]$ClusterId,
+        [string]$MemberId,
+        [int]$IntervalSec = 60,
+        [int]$MaxAttempts = 30
+    )
+
+    for ($i = 1; $i -le $MaxAttempts; $i++) {
+        Write-Host "    [POLL $i/$MaxAttempts] Checking update status..." -ForegroundColor DarkGray
+
+        try {
+            $checkParams = @{
+                GatewayClusterId = $ClusterId
+                CheckStatus      = $true
+            }
+            if ($MemberId) {
+                $checkParams["MemberGatewayId"] = $MemberId
+            }
+
+            $result = Update-DataGatewayClusterMember @checkParams
+            $state  = $result.Status
+
+            Write-Host "    [POLL] Current state: $state" -ForegroundColor DarkGray
+
+            if ($state -eq "Completed" -or $state -eq "Succeeded") {
+                return @{ Success = $true; State = $state }
+            }
+            elseif ($state -eq "Failed") {
+                return @{ Success = $false; State = $state }
+            }
+        }
+        catch {
+            Write-Warning "    [POLL] Error checking status: $_"
+        }
+
+        Start-Sleep -Seconds $IntervalSec
+    }
+
+    return @{ Success = $false; State = "Timeout" }
+}
+
+function Update-SingleMember {
+    param(
+        [Parameter(Mandatory)][string]$ClusterId,
+        [string]$MemberId,
+        [string]$DisplayName
+    )
+
+    Write-Host "  [UPDATE] Triggering update for '$DisplayName'..." -ForegroundColor Yellow
+
+    try {
+        $updateParams = @{ GatewayClusterId = $ClusterId }
+        if ($MemberId) {
+            $updateParams["MemberGatewayId"] = $MemberId
+        }
+
+        Update-DataGatewayClusterMember @updateParams
+        Write-Host "  [UPDATE] Update command sent. Polling for completion..." -ForegroundColor Yellow
+    }
+    catch {
+        Write-Error "  [UPDATE] Failed to trigger update for '$DisplayName': $_"
+        return $false
+    }
+
+    $result = Wait-ForUpdateCompletion `
+        -ClusterId $ClusterId `
+        -MemberId $MemberId `
+        -IntervalSec $PollIntervalSeconds `
+        -MaxAttempts $MaxPollAttempts
+
+    if ($result.Success) {
+        Write-Host "  [UPDATE] '$DisplayName' updated successfully." -ForegroundColor Green
+        return $true
+    }
+    else {
+        Write-Warning "  [UPDATE] '$DisplayName' update ended with state: $($result.State)"
+        return $false
+    }
+}
+
+# ============================================================
+# SECTION 9: Execute Rolling Updates
+# ============================================================
+
+$report = @()
+
+foreach ($cluster in $allClusters) {
+    $clusterId   = $cluster.Id
+    $clusterName = $cluster.Name
+    $members     = $cluster.MemberGateways
+
+    Write-Host "============================================" -ForegroundColor Cyan
+    Write-Host "Processing cluster: $clusterName ($clusterId)" -ForegroundColor Cyan
+    Write-Host "============================================" -ForegroundColor Cyan
+
+    # ----------------------------------------------------------
+    # Case A: Single-member cluster
+    # ----------------------------------------------------------
+    if (-not $members -or $members.Count -le 1) {
+        Write-Host "  Single-member cluster — updating directly." -ForegroundColor White
+
+        $success = Update-SingleMember `
+            -ClusterId $clusterId `
+            -DisplayName $clusterName
+
+        $report += [PSCustomObject]@{
+            Cluster  = $clusterName
+            Member   = "(single)"
+            Action   = "Update"
+            Result   = if ($success) { "Success" } else { "Failed" }
+        }
+    }
+    # ----------------------------------------------------------
+    # Case B: Multi-member cluster — rolling update
+    # ----------------------------------------------------------
+    else {
+        Write-Host "  Multi-member cluster ($($members.Count) members) — rolling update." -ForegroundColor White
+
+        foreach ($member in $members) {
+            $memberId   = $member.Id
+            $memberName = $member.Name
+
+            Write-Host "`n  --- Member: $memberName ($memberId) ---" -ForegroundColor White
+
+            # Step 1: Disable the member
+            Write-Host "  [STEP 1] Disabling member '$memberName'..." -ForegroundColor Yellow
+            try {
+                Set-DataGatewayCluster `
+                    -GatewayClusterId $clusterId `
+                    -MemberGatewayId $memberId `
+                    -Enabled $false
+                Write-Host "  [STEP 1] Member disabled." -ForegroundColor Green
+            }
+            catch {
+                Write-Warning "  [STEP 1] Could not disable member: $_. Proceeding anyway."
+            }
+
+            # Step 2: Wait for in-flight queries to drain
+            Write-Host "  [STEP 2] Waiting $DrainWaitMinutes min for queries to drain..." -ForegroundColor Yellow
+            Start-Sleep -Seconds ($DrainWaitMinutes * 60)
+
+            # Step 3: Trigger the update
+            $success = Update-SingleMember `
+                -ClusterId $clusterId `
+                -MemberId $memberId `
+                -DisplayName "$clusterName/$memberName"
+
+            # Step 4: Re-enable the member
+            Write-Host "  [STEP 4] Re-enabling member '$memberName'..." -ForegroundColor Yellow
+            try {
+                Set-DataGatewayCluster `
+                    -GatewayClusterId $clusterId `
+                    -MemberGatewayId $memberId `
+                    -Enabled $true
+                Write-Host "  [STEP 4] Member re-enabled." -ForegroundColor Green
+            }
+            catch {
+                Write-Warning "  [STEP 4] Could not re-enable member: $_. Manual intervention needed."
+            }
+
+            $report += [PSCustomObject]@{
+                Cluster  = $clusterName
+                Member   = $memberName
+                Action   = "Rolling Update"
+                Result   = if ($success) { "Success" } else { "Failed" }
+            }
+
+            Write-Host "  --- Member '$memberName' complete. ---`n" -ForegroundColor White
+        }
+    }
+}
+
+# ============================================================
+# SECTION 10: Summary Report
+# ============================================================
+
+Write-Host "`n===================== UPDATE REPORT =====================" -ForegroundColor Cyan
+$report | Format-Table -AutoSize
+Write-Host "========================================================`n" -ForegroundColor Cyan
+
+$failed = $report | Where-Object { $_.Result -eq "Failed" }
+if ($failed) {
+    Write-Warning "The following members failed to update:"
+    $failed | Format-Table -AutoSize
+    Write-Host "Review the output above and check gateway logs on the affected machines."
+    exit 1
+}
+else {
+    Write-Host "All gateways updated successfully." -ForegroundColor Green
+    exit 0
+}
