@@ -1,0 +1,404 @@
+#Requires -Version 7.0
+<#
+.SYNOPSIS
+    Programmatically updates all on-premises data gateway clusters across
+    a tenant using Update-DataGatewayClusterMember, following Microsoft's
+    recommended rolling-update strategy.
+
+.DESCRIPTION
+    This script:
+      1. Authenticates to the Data Gateway service via a service principal.
+      2. Discovers all gateway clusters in the tenant (Organization scope).
+      3. For each cluster, retrieves member status and version info.
+      4. For multi-member clusters, performs a rolling update: disable a
+         member, wait for queries to drain, update, re-enable, then move
+         to the next member.
+      5. For single-member clusters, updates directly.
+      6. Polls -CheckStatus after each update to confirm completion.
+      7. Outputs a summary report of all actions taken.
+
+.NOTES
+    Prerequisites:
+      - PowerShell 7.0.6 or higher
+      - DataGateway module (Install-Module -Name DataGateway)
+      - A service principal with:
+          • Tenant.Read.All and Tenant.ReadWrite.All permissions on Power BI
+          • Gateway Admin rights (or Global Admin / Fabric Admin role)
+      - All gateways must already be on the November 2025 baseline version
+        or later for Update-DataGatewayClusterMember to work.
+
+    Designed to be run as a scheduled task (e.g., Azure Automation, Windows
+    Task Scheduler, or a CI/CD pipeline) on a monthly cadence after each
+    Microsoft gateway release.
+
+.PARAMETER ApplicationId
+    The Application (Client) ID of the service principal.
+
+.PARAMETER TenantId
+    The Azure AD / Entra ID Tenant (Directory) ID.
+
+.PARAMETER ClientSecret
+    The client secret for the service principal. For production use,
+    retrieve this from Azure Key Vault rather than hardcoding.
+
+.PARAMETER DrainWaitMinutes
+    Minutes to wait for in-flight queries to drain after disabling a
+    gateway member. Default is 30. Increase for environments with
+    long-running refresh jobs.
+
+.PARAMETER PollIntervalSeconds
+    Seconds between status polls when checking update progress.
+    Default is 60.
+
+.PARAMETER MaxPollAttempts
+    Maximum number of polling attempts before timing out.
+    Default is 30 (i.e., 30 minutes at 60-second intervals).
+
+.PARAMETER WhatIf
+    If specified, the script discovers and reports on all gateways
+    but does NOT trigger any updates. Use this for a dry run.
+
+.EXAMPLE
+    .\Update-AllTenantGateways.ps1 `
+        -ApplicationId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+        -TenantId "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
+        -ClientSecret "your-secret-here" `
+        -DrainWaitMinutes 30
+
+.EXAMPLE
+    # Dry run — discover and report only, no updates
+    .\Update-AllTenantGateways.ps1 `
+        -ApplicationId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+        -TenantId "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
+        -ClientSecret "your-secret-here" `
+        -WhatIf
+#>
+
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    [Parameter(Mandatory)]
+    [string]$ApplicationId,
+
+    [Parameter(Mandatory)]
+    [string]$TenantId,
+
+    [Parameter(Mandatory)]
+    [string]$ClientSecret,
+
+    [int]$DrainWaitMinutes = 30,
+
+    [int]$PollIntervalSeconds = 60,
+
+    [int]$MaxPollAttempts = 30
+)
+
+# ============================================================
+# SECTION 1: Module Check and Authentication
+# ============================================================
+
+# Ensure the DataGateway module is available
+if (-not (Get-Module -ListAvailable -Name DataGateway)) {
+    Write-Host "[SETUP] DataGateway module not found. Installing..." -ForegroundColor Yellow
+    Install-Module -Name DataGateway -Scope CurrentUser -Force
+}
+Import-Module DataGateway -Force
+
+# Authenticate using the service principal
+Write-Host "[AUTH] Connecting to Data Gateway service as service principal..." -ForegroundColor Cyan
+$secureSecret = $ClientSecret | ConvertTo-SecureString -AsPlainText -Force
+
+try {
+    Connect-DataGatewayServiceAccount `
+        -ApplicationId $ApplicationId `
+        -ClientSecret $secureSecret `
+        -Tenant $TenantId
+    Write-Host "[AUTH] Successfully authenticated." -ForegroundColor Green
+}
+catch {
+    Write-Error "[AUTH] Failed to authenticate: $_"
+    exit 1
+}
+
+# ============================================================
+# SECTION 2: Discover All Gateway Clusters (Tenant-Wide)
+# ============================================================
+
+Write-Host "`n[DISCOVERY] Retrieving all gateway clusters in the tenant..." -ForegroundColor Cyan
+
+try {
+    $allClusters = Get-DataGatewayCluster -Scope Organization
+}
+catch {
+    Write-Error "[DISCOVERY] Failed to retrieve clusters: $_"
+    exit 1
+}
+
+if (-not $allClusters -or $allClusters.Count -eq 0) {
+    Write-Host "[DISCOVERY] No gateway clusters found in this tenant." -ForegroundColor Yellow
+    exit 0
+}
+
+Write-Host "[DISCOVERY] Found $($allClusters.Count) gateway cluster(s).`n" -ForegroundColor Green
+
+# ============================================================
+# SECTION 3: Build Inventory — Cluster Status and Versions
+# ============================================================
+
+$inventory = @()
+
+foreach ($cluster in $allClusters) {
+    $clusterId = $cluster.Id
+    $clusterName = $cluster.Name
+
+    try {
+        $status = Get-DataGatewayClusterStatus `
+            -GatewayClusterId $clusterId `
+            -Scope Organization
+        
+        $inventory += [PSCustomObject]@{
+            ClusterName    = $clusterName
+            ClusterId      = $clusterId
+            ClusterStatus  = $status.ClusterStatus
+            GatewayVersion = $status.GatewayVersion
+            UpgradeState   = $status.GatewayUpgradeState
+            MemberCount    = if ($cluster.MemberGateways) { 
+                                 $cluster.MemberGateways.Count 
+                             } else { 1 }
+        }
+    }
+    catch {
+        Write-Warning "[INVENTORY] Could not get status for cluster '$clusterName' ($clusterId): $_"
+        $inventory += [PSCustomObject]@{
+            ClusterName    = $clusterName
+            ClusterId      = $clusterId
+            ClusterStatus  = "Unknown"
+            GatewayVersion = "Unknown"
+            UpgradeState   = "Unknown"
+            MemberCount    = 0
+        }
+    }
+}
+
+# Display the inventory
+Write-Host "==================== GATEWAY INVENTORY ====================" -ForegroundColor Cyan
+$inventory | Format-Table -AutoSize
+Write-Host "==========================================================`n" -ForegroundColor Cyan
+
+# ============================================================
+# SECTION 4: If -WhatIf, stop here after reporting
+# ============================================================
+
+if ($WhatIfPreference) {
+    Write-Host "[DRY RUN] -WhatIf specified. No updates will be performed." -ForegroundColor Yellow
+    Write-Host "[DRY RUN] Review the inventory above. Remove -WhatIf to execute updates."
+    exit 0
+}
+
+# ============================================================
+# SECTION 5: Helper Functions
+# ============================================================
+
+function Wait-ForUpdateCompletion {
+    <#
+    .SYNOPSIS
+        Polls Update-DataGatewayClusterMember -CheckStatus until the
+        update completes, fails, or times out.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterId,
+        [string]$MemberId,
+        [int]$IntervalSec = 60,
+        [int]$MaxAttempts = 30
+    )
+
+    for ($i = 1; $i -le $MaxAttempts; $i++) {
+        Write-Host "    [POLL $i/$MaxAttempts] Checking update status..." -ForegroundColor DarkGray
+        
+        try {
+            $checkParams = @{ 
+                GatewayClusterId = $ClusterId
+                CheckStatus      = $true
+            }
+            if ($MemberId) { 
+                $checkParams["MemberGatewayId"] = $MemberId 
+            }
+
+            $result = Update-DataGatewayClusterMember @checkParams
+            
+            # The exact status values will depend on the preview API.
+            # Common states: "Updating", "Completed", "Failed", "NotStarted"
+            $state = $result.Status
+            Write-Host "    [POLL] Current state: $state" -ForegroundColor DarkGray
+
+            if ($state -eq "Completed" -or $state -eq "Succeeded") {
+                return @{ Success = $true; State = $state }
+            }
+            elseif ($state -eq "Failed") {
+                return @{ Success = $false; State = $state }
+            }
+        }
+        catch {
+            Write-Warning "    [POLL] Error checking status: $_"
+        }
+
+        Start-Sleep -Seconds $IntervalSec
+    }
+
+    return @{ Success = $false; State = "Timeout" }
+}
+
+function Update-SingleMember {
+    <#
+    .SYNOPSIS
+        Updates a single gateway member (or an entire single-member cluster).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterId,
+        [string]$MemberId,
+        [string]$DisplayName
+    )
+
+    Write-Host "  [UPDATE] Triggering update for '$DisplayName'..." -ForegroundColor Yellow
+
+    try {
+        $updateParams = @{ GatewayClusterId = $ClusterId }
+        if ($MemberId) { 
+            $updateParams["MemberGatewayId"] = $MemberId 
+        }
+
+        Update-DataGatewayClusterMember @updateParams
+        Write-Host "  [UPDATE] Update command sent. Polling for completion..." -ForegroundColor Yellow
+    }
+    catch {
+        Write-Error "  [UPDATE] Failed to trigger update for '$DisplayName': $_"
+        return $false
+    }
+
+    $result = Wait-ForUpdateCompletion `
+        -ClusterId $ClusterId `
+        -MemberId $MemberId `
+        -IntervalSec $PollIntervalSeconds `
+        -MaxAttempts $MaxPollAttempts
+
+    if ($result.Success) {
+        Write-Host "  [UPDATE] '$DisplayName' updated successfully." -ForegroundColor Green
+        return $true
+    }
+    else {
+        Write-Warning "  [UPDATE] '$DisplayName' update ended with state: $($result.State)"
+        return $false
+    }
+}
+
+# ============================================================
+# SECTION 6: Execute Rolling Updates
+# ============================================================
+
+$report = @()
+
+foreach ($cluster in $allClusters) {
+    $clusterId = $cluster.Id
+    $clusterName = $cluster.Name
+    $members = $cluster.MemberGateways
+
+    Write-Host "============================================" -ForegroundColor Cyan
+    Write-Host "Processing cluster: $clusterName ($clusterId)" -ForegroundColor Cyan
+    Write-Host "============================================" -ForegroundColor Cyan
+
+    # ----------------------------------------------------------
+    # Case A: Single-member cluster (or no member detail available)
+    # ----------------------------------------------------------
+    if (-not $members -or $members.Count -le 1) {
+        Write-Host "  Single-member cluster — updating directly." -ForegroundColor White
+
+        $success = Update-SingleMember `
+            -ClusterId $clusterId `
+            -DisplayName $clusterName
+
+        $report += [PSCustomObject]@{
+            Cluster  = $clusterName
+            Member   = "(single)"
+            Action   = "Update"
+            Result   = if ($success) { "Success" } else { "Failed" }
+        }
+    }
+    # ----------------------------------------------------------
+    # Case B: Multi-member cluster — rolling update
+    # ----------------------------------------------------------
+    else {
+        Write-Host "  Multi-member cluster ($($members.Count) members) — rolling update." -ForegroundColor White
+
+        foreach ($member in $members) {
+            $memberId   = $member.Id
+            $memberName = $member.Name
+
+            Write-Host "`n  --- Member: $memberName ($memberId) ---" -ForegroundColor White
+
+            # Step 1: Disable the member so the load balancer stops
+            #         routing queries to it.
+            Write-Host "  [STEP 1] Disabling member '$memberName'..." -ForegroundColor Yellow
+            try {
+                Set-DataGatewayCluster `
+                    -GatewayClusterId $clusterId `
+                    -MemberGatewayId $memberId `
+                    -Enabled $false
+                Write-Host "  [STEP 1] Member disabled." -ForegroundColor Green
+            }
+            catch {
+                Write-Warning "  [STEP 1] Could not disable member: $_. Proceeding anyway."
+            }
+
+            # Step 2: Wait for in-flight queries to drain.
+            Write-Host "  [STEP 2] Waiting $DrainWaitMinutes minute(s) for queries to drain..." -ForegroundColor Yellow
+            Start-Sleep -Seconds ($DrainWaitMinutes * 60)
+
+            # Step 3: Trigger the update on this specific member.
+            $success = Update-SingleMember `
+                -ClusterId $clusterId `
+                -MemberId $memberId `
+                -DisplayName "$clusterName/$memberName"
+
+            # Step 4: Re-enable the member.
+            Write-Host "  [STEP 4] Re-enabling member '$memberName'..." -ForegroundColor Yellow
+            try {
+                Set-DataGatewayCluster `
+                    -GatewayClusterId $clusterId `
+                    -MemberGatewayId $memberId `
+                    -Enabled $true
+                Write-Host "  [STEP 4] Member re-enabled." -ForegroundColor Green
+            }
+            catch {
+                Write-Warning "  [STEP 4] Could not re-enable member: $_. Manual intervention may be needed."
+            }
+
+            $report += [PSCustomObject]@{
+                Cluster  = $clusterName
+                Member   = $memberName
+                Action   = "Rolling Update"
+                Result   = if ($success) { "Success" } else { "Failed" }
+            }
+
+            Write-Host "  --- Member '$memberName' complete. Moving to next. ---`n" -ForegroundColor White
+        }
+    }
+}
+
+# ============================================================
+# SECTION 7: Summary Report
+# ============================================================
+
+Write-Host "`n===================== UPDATE REPORT =====================" -ForegroundColor Cyan
+$report | Format-Table -AutoSize
+Write-Host "========================================================`n" -ForegroundColor Cyan
+
+$failed = $report | Where-Object { $_.Result -eq "Failed" }
+if ($failed) {
+    Write-Warning "The following members failed to update:"
+    $failed | Format-Table -AutoSize
+    Write-Host "Review the output above and check gateway logs on the affected machines."
+    exit 1
+}
+else {
+    Write-Host "All gateways updated successfully." -ForegroundColor Green
+    exit 0
+}
